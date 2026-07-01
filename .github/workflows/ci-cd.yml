@@ -1,0 +1,107 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # needed for Vault login if using OIDC (not used here but safe)
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ghcr.io/Navneet072300/token-bucket-rate-limiter
+      APP_NAME: token-bucket-rate-limiter
+
+    steps:
+      # 1️⃣ Checkout source
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Set up Node (for lint/test if needed)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # 3️⃣ Install dependencies & run lint/tests (optional but recommended)
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: npm test --if-present
+
+      # 4️⃣ Log in to GitHub Container Registry
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5️⃣ Build and push Docker image (both SHA tag & latest)
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      # 6️⃣ Vault login (using provided VAULT_ADDR & VAULT_TOKEN)
+      - name: Vault login
+        uses: hashicorp/vault-action@v2
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+
+      # 7️⃣ Retrieve secret from Vault (example: API_KEY)
+      - name: Retrieve API_KEY from Vault
+        id: vault-secret
+        run: |
+          SECRET=$(vault kv get -field=api_key secret/data/${{ env.APP_NAME }})
+          echo "API_KEY=$SECRET" >> $GITHUB_OUTPUT
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+
+      # 8️⃣ Set up kubectl
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
+
+      # 9️⃣ Decode KUBE_CONFIG and set as kubectl config
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          echo "${KUBE_CONFIG_B64}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # 🔟 Deploy new image to Kubernetes
+      - name: Update image in Kubernetes Deployment
+        run: |
+          kubectl set image deployment/${{ env.APP_NAME }} \
+            ${{ env.APP_NAME }}=${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --record
+
+      # 1️⃣1️⃣ Wait for rollout to finish
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} --timeout=5m
